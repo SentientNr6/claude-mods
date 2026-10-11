@@ -1,0 +1,5 @@
+{
+  "name": "claude-mods",
+  "owner": { "name": "SentientNr6" },
+  "plugins": [{ "name": "turn-monitor", "source": "./mods/turn-monitor" }]
+}

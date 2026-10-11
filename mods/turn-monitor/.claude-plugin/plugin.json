@@ -1,0 +1,6 @@
+{
+  "name": "turn-monitor",
+  "version": "0.3.0",
+  "description": "Shows each finished turn's time, tokens, context fill and CPU load in a band above the prompt, and logs every turn to a JSONL file. CPU and the log need Windows.",
+  "types": "./types/index.d.ts"
+}
