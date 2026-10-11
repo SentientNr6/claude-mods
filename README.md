@@ -8,6 +8,8 @@ Mods for Claude Code, installable as a marketplace.
 
 ![turn-monitor: model, time, context, tokens and CPU for the last turn](mods/turn-monitor/docs/band.png)
 
+![turn-monitor after a long turn: CPU, free RAM and paging figures](mods/turn-monitor/docs/band-memory.png)
+
 ## Install
 
 In a terminal Claude Code session:

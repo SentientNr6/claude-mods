@@ -59,6 +59,14 @@ const modelName = (id: string) => {
   return version.length === 0 ? name : `${name} ${version.join('.')}`
 }
 
+// The first group: the model, then the effort it was asked for when it takes one
+// (a turn kept in state from before the effort was recorded has none either).
+// The effort starts with a capital: high -> High.
+const modelLabel = (turn: TurnCost) =>
+  turn.model === null || turn.effort === null || turn.effort === undefined
+    ? turn.model
+    : `${turn.model} ${turn.effort.charAt(0).toUpperCase()}${turn.effort.slice(1)}`
+
 // One colour per group, in drawing order: model, time, context, input, output.
 const MODEL = '#facc15'
 const TIME = '#3b82f6'
@@ -66,6 +74,7 @@ const CONTEXT = '#10b981'
 const INPUT = '#a855f7'
 const OUTPUT = '#86efac'
 const CPU = '#fb923c'
+const MEM = '#22d3ee'
 
 // CPU load is sampled by one long-running typeperf, and shown only for turns
 // that took longer than this.
@@ -81,13 +90,17 @@ const CONTEXT_HIGH = '#ef4444'
 // The space between two groups.
 const GAP = '    '
 
+// In front of the dimmed band while a turn runs.
+const STALE_LABEL = 'last turn'
+
 // The context turns red and bold, with !!!, from this fill upwards.
 const HIGH_PERCENT = 80
 const isHigh = (percent: number | null) => percent !== null && percent >= HIGH_PERCENT
 
 // The CPU graph of one turn, captured when the turn ends and kept as it was: one
-// bar per bucket of samples (its maximum, so a spike stays visible), red from the
-// hot threshold. It sits in a card that hovering the cpu group reveals.
+// bar per bucket of samples (its mean, so the red share of the bars tracks the
+// share of hot samples), red from the hot threshold, with a thin tick at the
+// bucket's peak (red from the hot threshold, orange below) so a spike stays visible. It sits in a card that hovering the cpu group reveals.
 const GRAPH_W = 240
 const GRAPH_H = 36
 const GRAPH_MAX_BARS = 40
@@ -95,15 +108,17 @@ const GRAPH_MAX_BARS = 40
 const downsample = (list: { t: number; v: number }[]) => {
   const size = Math.max(1, Math.ceil(list.length / GRAPH_MAX_BARS))
   const points: number[] = []
+  const peaks: number[] = []
   const times: number[] = []
 
   for (let i = 0; i < list.length; i += size) {
     const bucket = list.slice(i, i + size)
-    points.push(Math.max(...bucket.map(s => s.v)))
+    points.push(bucket.reduce((sum, s) => sum + s.v, 0) / bucket.length)
+    peaks.push(Math.max(...bucket.map(s => s.v)))
     times.push(bucket[0]!.t)
   }
 
-  return { points, times }
+  return { points, peaks, times }
 }
 
 const clock = (ms: number) => {
@@ -113,19 +128,29 @@ const clock = (ms: number) => {
   return `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`
 }
 
-const sparkline = (points: number[], times: number[]) => {
+const sparkline = (points: number[], peaks: number[], times: number[]) => {
   const step = GRAPH_W / points.length
   const hotY = GRAPH_H - (CPU_HOT_PERCENT / 100) * GRAPH_H
 
   const bars = points.map((v, i) => {
     const h = Math.max(1, Math.round((v / 100) * GRAPH_H))
     const fill = v >= CPU_HOT_PERCENT ? CONTEXT_HIGH : CPU
-    const title = `${clock(times[i] ?? 0)}  ${Math.round(v)}%`
+    const peak = peaks[i] ?? v
+    const title = `${clock(times[i] ?? 0)}  avg ${Math.round(v)}%, peak ${Math.round(peak)}%`
+    const x = (i * step).toFixed(2)
+    const w = Math.max(1, step - 1).toFixed(2)
+    const peakH = Math.max(1, Math.round((peak / 100) * GRAPH_H))
+
+    // The tick sits at the peak, only when it clears the bar's top by a pixel.
+    const tick =
+      peakH > h + 1
+        ? `<rect x="${x}" y="${GRAPH_H - peakH}" width="${w}" height="1.5" ` +
+          `fill="${peak >= CPU_HOT_PERCENT ? CONTEXT_HIGH : CPU}"/>`
+        : ''
 
     return (
-      `<rect x="${(i * step).toFixed(2)}" y="${GRAPH_H - h}" ` +
-      `width="${Math.max(1, step - 1).toFixed(2)}" height="${h}" fill="${fill}">` +
-      `<title>${title}</title></rect>`
+      `<rect x="${x}" y="${GRAPH_H - h}" width="${w}" height="${h}" fill="${fill}">` +
+      `<title>${title}</title></rect>${tick}`
     )
   })
 
@@ -146,7 +171,8 @@ const plainLine = (turn: TurnCost) => {
   const t = turn.tokens
   const parts: string[] = []
 
-  if (turn.model !== null) parts.push(turn.model)
+  const model = modelLabel(turn)
+  if (model !== null) parts.push(model)
   parts.push(turn.duration)
 
   if (turn.context !== null) {
@@ -161,12 +187,17 @@ const plainLine = (turn: TurnCost) => {
   if (turn.cpu !== null) {
     parts.push(`cpu:${turn.cpu.avg}% (${turn.cpu.peak}%, ${hotShare(turn.cpu)}%)`)
   }
+  if (turn.mem !== null) parts.push(`free:${turn.mem.avg} (${turn.mem.min})`)
 
   return parts.join(GAP)
 }
 
-// One reading of the machine: CPU load (percent) and processor queue length.
-type Sample = { t: number; v: number; q: number }
+// One reading of the machine: CPU load (percent), processor queue length, free
+// RAM (MB) and pages per second (the paging that signals memory pressure).
+type Sample = { t: number; v: number; q: number; m: number; p: number }
+
+// 9312 -> 9.1G
+const gb = (mb: number) => `${(mb / 1024).toFixed(1)}G`
 
 const mean = (xs: number[]) =>
   xs.length === 0 ? null : xs.reduce((a, b) => a + b, 0) / xs.length
@@ -203,6 +234,18 @@ export const register: Register = on => {
   let toolSpans: [number, number][] = []
   let isLogFailureShown = false
 
+  // The effort of this turn's last main-loop request; null when the model takes
+  // none, or no request was made.
+  let effort: string | null = null
+
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId === undefined) {
+      effort = e.effort === undefined ? null : String(e.effort)
+    }
+
+    return yield* next(e)
+  })
+
   on('classic.SessionStart', ($, e, next) => {
     title = e.session_title ?? title
 
@@ -233,8 +276,10 @@ export const register: Register = on => {
       try {
         const load = '\\Processor(_Total)\\% Processor Time'
         const queue = '\\System\\Processor Queue Length'
+        const free = '\\Memory\\Available MBytes'
+        const paging = '\\Memory\\Pages/sec'
         const child = $.process.spawn({
-          argv: ['typeperf', load, queue, '-si', String(SAMPLE_SECONDS)],
+          argv: ['typeperf', load, queue, free, paging, '-si', String(SAMPLE_SECONDS)],
         })
         let rest = ''
 
@@ -246,11 +291,12 @@ export const register: Register = on => {
           const t = await $.clock.now()
 
           for (const line of lines) {
-            const m = /^"[^"]*","([0-9.]+)","([0-9.]+)"\s*$/.exec(line)
+            const m =
+              /^"[^"]*","([0-9.]+)","([0-9.]+)","([0-9.]+)","([0-9.]+)"\s*$/.exec(line)
             if (m === null) continue
 
             const v = Number(m[1])
-            samples.push({ t, v, q: Number(m[2]) })
+            samples.push({ t, v, q: Number(m[2]), m: Number(m[3]), p: Number(m[4]) })
             total += 1
             if (v >= CPU_HOT_PERCENT) hot += 1
           }
@@ -275,6 +321,8 @@ export const register: Register = on => {
     }
 
     const u = e.usage
+    const turnEffort = effort
+    effort = null
     const { context } = await $.session.usage()
 
     // CPU over the turn's own window, for turns longer than MIN_TURN_MS only.
@@ -291,6 +339,16 @@ export const register: Register = on => {
           }
         : null
 
+    // Free RAM and paging over the same window and for the same turns.
+    const mem =
+      e.durationMs > MIN_TURN_MS && inTurn.length > 0
+        ? {
+            avg: gb(mean(inTurn.map(s => s.m)) ?? 0),
+            min: gb(Math.min(...inTurn.map(s => s.m))),
+            pagesPeak: Math.round(Math.max(...inTurn.map(s => s.p))),
+          }
+        : null
+
     const session =
       total === 0
         ? null
@@ -301,6 +359,7 @@ export const register: Register = on => {
 
     const turn: TurnCost = {
       cpu,
+      mem,
       hot: session,
       context:
         context.tokens === undefined
@@ -308,6 +367,7 @@ export const register: Register = on => {
           : { tokens: count(context.tokens), percent: context.percent ?? null },
       duration: duration(e.durationMs),
       model: u === undefined ? null : modelName(u.model),
+      effort: u === undefined ? null : turnEffort,
       tokens:
         u === undefined
           ? null
@@ -367,6 +427,7 @@ export const register: Register = on => {
         session_title: sessionTitle,
         project: cwd,
         model: u === undefined ? null : u.model,
+        effort: turnEffort,
         reason: e.reason,
         duration_ms: e.durationMs,
         tool_ms: toolMs,
@@ -384,6 +445,13 @@ export const register: Register = on => {
         tool_hot_ms: hotMs(inTool),
         tool_queue_avg: round1(mean(queue(inTool))),
         tool_queue_peak: peakOf(queue(inTool)),
+        mem_free_avg_mb: round1(mean(inTurn.map(s => s.m))),
+        mem_free_min_mb: inTurn.length === 0 ? null : Math.min(...inTurn.map(s => s.m)),
+        pages_avg: round1(mean(inTurn.map(s => s.p))),
+        pages_peak: peakOf(inTurn.map(s => s.p)),
+        tool_mem_free_min_mb:
+          inTool.length === 0 ? null : Math.min(...inTool.map(s => s.m)),
+        tool_pages_peak: peakOf(inTool.map(s => s.p)),
         cores: Number(await $.env.get('NUMBER_OF_PROCESSORS')) || null,
         input_tokens: u === undefined ? null : u.input_tokens,
         output_tokens: u === undefined ? null : u.output_tokens,
@@ -428,6 +496,10 @@ export const register: Register = on => {
     const Svg = 'Svg' in elements ? elements.Svg : undefined
     const open = await read($, isOpen)
 
+    // While the next turn runs the figures are still the previous turn's: the
+    // band is drawn dim behind a label, so nobody reads them as live.
+    const stale = e.props.isWorking
+
     // Nothing has finished since the mod loaded (a reload starts the band empty).
     if (turn === null) {
       return (
@@ -440,7 +512,15 @@ export const register: Register = on => {
     if (turn.tokens === null) {
       return (
         <Box>
-          <Text color={TIME}>{turn.duration}</Text>
+          {stale && (
+            <Text dimColor>
+              {STALE_LABEL}
+              {GAP}
+            </Text>
+          )}
+          <Text color={TIME} dimColor={stale}>
+            {turn.duration}
+          </Text>
           <Text dimColor>  no tokens recorded ({turn.reason})</Text>
         </Box>
       )
@@ -453,11 +533,17 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         <Box>
-        <Text color={MODEL}>
-          {turn.model}
+        {stale && (
+          <Text dimColor>
+            {STALE_LABEL}
+            {GAP}
+          </Text>
+        )}
+        <Text color={MODEL} dimColor={stale}>
+          {modelLabel(turn)}
           {GAP}
         </Text>
-        <Text color={TIME}>
+        <Text color={TIME} dimColor={stale}>
           {turn.duration}
           {GAP}
         </Text>
@@ -465,6 +551,7 @@ export const register: Register = on => {
           <Text
             color={isHigh(turn.context.percent) ? CONTEXT_HIGH : CONTEXT}
             bold={isHigh(turn.context.percent)}
+            dimColor={stale}
           >
             ctx:{turn.context.tokens}
             {turn.context.percent === null ? '' : ` ${turn.context.percent}%`}
@@ -472,15 +559,25 @@ export const register: Register = on => {
             {GAP}
           </Text>
         )}
-        <Text color={INPUT}>
+        <Text color={INPUT} dimColor={stale}>
           cw:{t.write} in:{t.input} cr:{t.read}
           {GAP}
         </Text>
-        <Text color={OUTPUT}>out:{t.output}</Text>
+        <Text color={OUTPUT} dimColor={stale}>
+          out:{t.output}
+        </Text>
         {cpu !== null && (
-          <Text color={CPU}>
+          <Text color={CPU} dimColor={stale}>
             {GAP}cpu:{cpu.avg}% ({cpu.peak}%
-            <Text color={HOT}>, {hotShare(cpu)}%</Text>)
+            <Text color={HOT} dimColor={stale}>
+              , {hotShare(cpu)}%
+            </Text>
+            )
+          </Text>
+        )}
+        {turn.mem !== null && (
+          <Text color={MEM} dimColor={stale}>
+            {GAP}free:{turn.mem.avg} ({turn.mem.min})
           </Text>
         )}
         {cpu !== null && cpu.points.length > 1 && (
@@ -496,20 +593,26 @@ export const register: Register = on => {
         </Box>
         {cpu !== null && cpu.points.length > 1 && open && (
           <Box flexDirection="column">
-            <Text color={CPU}>
+            <Text color={CPU} dimColor={stale}>
               CPU during the turn: {clock(cpu.times[0] ?? 0)} to{' '}
               {clock(cpu.times[cpu.times.length - 1] ?? 0)}, avg {cpu.avg}%, peak{' '}
               {cpu.peak}%
             </Text>
-            <Text color={HOT}>
+            <Text color={HOT} dimColor={stale}>
               At {CPU_HOT_PERCENT}%+ this turn:{' '}
               {hotShare(cpu)}% (
               {hotTime(cpu.hotSamples)}), session: {turn.hot?.percent ?? 0}% (
               {turn.hot?.minutes ?? 0}m)
             </Text>
+            {turn.mem !== null && (
+              <Text color={MEM} dimColor={stale}>
+                Free RAM during the turn: avg {turn.mem.avg}, min {turn.mem.min}, paging
+                peak {turn.mem.pagesPeak}/s
+              </Text>
+            )}
             {Svg !== undefined && (
               <Svg
-                source={sparkline(cpu.points, cpu.times)}
+                source={sparkline(cpu.points, cpu.peaks ?? [], cpu.times)}
                 alt={`CPU load during the turn, ${cpu.points.length} bars`}
                 width={GRAPH_W}
                 height={GRAPH_H}
